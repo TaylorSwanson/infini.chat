@@ -32,7 +32,7 @@ export class InfinichatInstance extends DurableObject {
 	// List of websockets that are actively connected
 	clients: Map<WebSocket, ClientState>;
 	// List of regions that are actively being watched and by whom
-	activeRegions: Map<[number, number], WebSocket[]>;
+	activeRegions: Map<string, WebSocket[]>;
 
 	constructor(state: DurableObjectState, env: Env) {
 		// Constructor executes when DO is first created
@@ -98,7 +98,7 @@ export class InfinichatInstance extends DurableObject {
 		let message: IncomingMessage;
 
 		try {
-			message = this.deserialize(payload);
+			message = this.deserializeMsg(payload);
 		} catch (e: unknown) {
 			console.error("Could not parse incoming message, error: " + e);
 
@@ -131,7 +131,7 @@ export class InfinichatInstance extends DurableObject {
 	// }
 
 	async handleError(ws: WebSocket, error: string) {
-		ws.send(this.serialize("error", { error }));
+		ws.send(this.serializeMsg("error", { error }));
 		console.error(error);
 	}
 
@@ -140,68 +140,135 @@ export class InfinichatInstance extends DurableObject {
 	// update -> change a specific character / set of characters
 	// load -> request contents of a region
 	async subscribe(ws: WebSocket, data: Record<string, any>) {
-		if (!data.regions) {
-			console.error("Client region subscribe request malformed");
+		if (!data.regions || !Array.isArray(data.regions)) {
+			this.handleError(ws, "Subscription request is malformed");
 			return;
 		}
-		if (!data.regions?.length) {
-			console.error("Client tried to subscribe to 0 regions");
+		if (!data.regions.length) {
+			this.handleError(ws, "Must subscribe to at least 1 region");
 			return;
 		}
-		if (data.regions?.length > MAX_ACTIVE_REGIONS) {
-			// Out of bounds
-			console.error(`Client tried to subscribe to too many regions: ${data.regions.length}`);
+		if (data.regions.length > MAX_ACTIVE_REGIONS) {
+			this.handleError(ws, `Cannot subscribe to more than ${MAX_ACTIVE_REGIONS} regions`);
+			return;
+		}
+		if (data.regions.some((region) => !this.isValidRegion(region))) {
+			this.handleError(ws, "One or more region keys is invalid");
+			return;
 		}
 
 		// Client state should be attached to websocket, but we'll be aware of
 		// the impossible case where it is not
 		const clientState = this.clients.get(ws);
-		const existingRegions: RegionList = clientState?.subscribedRegions ?? [];
+		const existingRegions: string[] = clientState?.subscribedRegions ?? [];
 
 		// Add regions, remove duplicates while noting new subscriptions
-		const newSubscriptions: RegionList = [];
+		const newSubscriptions: string[] = [];
 
 		// Note the order here: older subscriptions first, new ones last
-		const allRegions = [...existingRegions, ...data.regions].reduce<RegionList>(
-			(accum: RegionList, region: [number, number]) => {
-				// Search for region in the list - we'll have to compare the tuple
-				const exists = accum.some((r) => r[0] === region[0] && r[1] === region[1]);
+		const allRegions = [...existingRegions, ...data.regions].reduce<string[]>(
+			(accum: string[], region: string) => {
 				// Avoid duplicates subscriptions to the same regions
-				if (!exists) accum.push(region);
+				if (accum.indexOf(region) === -1) accum.push(region);
 				if (!existingRegions.includes(region)) newSubscriptions.push(region);
 
 				return accum;
 			},
-			[] as RegionList
+			[]
 		);
 
 		// Keep only the maximum subscribed regions - we'll remove first entries in the array
 		// which should presumably be the oldest subscriptions
 		const subscribedRegions = allRegions.slice(Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS));
 
-		// Any regions that were implicitly unsubscribed by overflowing the max active size
+		// Identify regions that were implicitly unsubscribed by overflowing the max active size
+		// i> slice returns (start, end]
 		const unsubscribedRegions = allRegions.slice(
 			0,
 			Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS)
 		);
 
-		// Update subscribed regions on this ws
+		// Update subscribed regions attached to this client
 		this.clients.set(ws, {
 			subscribedRegions: allRegions,
 		});
+		this.saveClientData(ws);
+
+		// Update tracked regions to match the new state
+		this.addClientToRegions(ws, subscribedRegions);
+		this.removeClientFromRegions(ws, unsubscribedRegions);
+
+		//
+		ws.send(
+			this.serializeMsg("subscriptions", {
+				subscribedRegions,
+				unsubscribedRegions,
+			})
+		);
+
+		// TODO send region data
+		// ws.send(this.serializeMsg("regionData", {
+		// 	regions: subscribedRegions.map(region => )
+		// }))
 	}
 	unsubscribe(ws: WebSocket, data: Record<string, any>) {}
 	update(ws: WebSocket, data: Record<string, any>) {}
 	load(ws: WebSocket, data: Record<string, any>) {}
 
-	addActiveRegions(ws: WebSocket, regions: RegionList) {
-		regions.forEach((region: [number, number]) => {
-			this.activeRegions.get();
+	// Trigger an update of the stored ClientState associated with this websocket
+	// This data will used to reinstantiate the instance if it hibernates
+	saveClientData(ws: WebSocket) {
+		const attachmentData = this.clients.get(ws);
+		if (!attachmentData) return;
+
+		// ClienState as a string
+		const attachment = JSON.stringify(attachmentData);
+		ws.serializeAttachment(attachment);
+	}
+
+	// Marks the websocket as a subscriber to a list of regions in activeRegions
+	// NOTE we're not validating region strings here - be mindful
+	addClientToRegions(ws: WebSocket, regions: string[]) {
+		regions.forEach((region: string) => {
+			const existingClients = this.activeRegions.get(region) ?? [];
+
+			if (existingClients.indexOf(ws) !== -1) return;
+
+			existingClients.push(ws);
+			this.activeRegions.set(region, existingClients);
 		});
 	}
 
+	removeClientFromRegions(ws: WebSocket, regions: string[]) {
+		regions.forEach((region: string) => {
+			const existingClients = this.activeRegions.get(region) ?? [];
+
+			const idx = existingClients.indexOf(ws);
+			if (idx === -1) return;
+
+			existingClients.splice(idx, 1);
+
+			if (existingClients.length === 0) {
+				// This client was the only subscriber, clean up
+				this.unloadRegion(region);
+				return;
+			}
+
+			this.activeRegions.set(region, existingClients);
+		});
+	}
+
+	// Invoke on a region to clear its cached data, if any
+	unloadRegion(region: string) {
+		// TODO
+		this.activeRegions.delete(region);
+	}
+	loadRegion(region: string) {
+		// TODO
+	}
+
 	// Must be a string formatted "[number]-[number]"
-	isValidRegion(regionString: string) {
+	isValidRegion(regionString: string): regionString is string {
 		if (!regionString?.length) return false;
 
 		// There must be exactly two numbers
@@ -218,8 +285,12 @@ export class InfinichatInstance extends DurableObject {
 		return true;
 	}
 
+	serializeRegion(region: string) {
+		//
+	}
+
 	// Helper fn to generate uniform websocket messages
-	serialize(type: string, data: Record<string, any>): string {
+	serializeMsg(type: string, data: Record<string, any>): string {
 		return JSON.stringify({
 			id: this.ctx.id.toString(),
 			name: this.ctx.id.name,
@@ -229,7 +300,7 @@ export class InfinichatInstance extends DurableObject {
 	}
 
 	// Parse incoming websocket messages
-	deserialize(rawMessage: string | ArrayBuffer): IncomingMessage {
+	deserializeMsg(rawMessage: string | ArrayBuffer): IncomingMessage {
 		const payload = JSON.parse(rawMessage.toString());
 
 		if (!payload?.message || !payload?.data) {
