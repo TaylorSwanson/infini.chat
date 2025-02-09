@@ -11,7 +11,7 @@ import { Env } from "./index";
 // Max number of regions one client can subscribe to at once
 const MAX_ACTIVE_REGIONS = 20;
 
-type RegionList = [number, number][];
+type RegionList = string[];
 
 interface ClientState {
 	subscribedRegions: RegionList;
@@ -63,7 +63,7 @@ export class InfinichatInstance extends DurableObject {
 					clientState = existingData as ClientState; // !
 				}
 
-				// TODO update this.activeRegions with subscription info
+				// TODO update this.activeRegions with individual subscription info
 			} catch (e) {
 				// The existing state is not set or is corrupt
 				// This does not matter, we've defaulted to an empty clientState already
@@ -94,7 +94,7 @@ export class InfinichatInstance extends DurableObject {
 		});
 	}
 
-	async webSocketMessage(ws: WebSocket, payload: string | ArrayBuffer): void | Promise<void> {
+	async webSocketMessage(ws: WebSocket, payload: string | ArrayBuffer): Promise<void> {
 		let message: IncomingMessage;
 
 		try {
@@ -113,20 +113,22 @@ export class InfinichatInstance extends DurableObject {
 		}
 
 		if (message.type === "subscribe") return this.subscribe(ws, message.data);
+		//
+		return;
 	}
 
-	async webSocketClose(
-		ws: WebSocket,
-		code: number,
-		reason: string,
-		wasClean: boolean
-	): void | Promise<void> {
-		//
-	}
+	// async webSocketClose(
+	// 	ws: WebSocket,
+	// 	code: number,
+	// 	reason: string,
+	// 	wasClean: boolean
+	// ): void | Promise<void> {
+	// 	//
+	// }
 
-	async webSocketError(ws: WebSocket, error: unknown): void | Promise<void> {
-		//
-	}
+	// async webSocketError(ws: WebSocket, error: unknown): void | Promise<void> {
+	// 	//
+	// }
 
 	async handleError(ws: WebSocket, error: string) {
 		ws.send(this.serialize("error", { error }));
@@ -176,9 +178,12 @@ export class InfinichatInstance extends DurableObject {
 		// Keep only the maximum subscribed regions - we'll remove first entries in the array
 		// which should presumably be the oldest subscriptions
 		const subscribedRegions = allRegions.slice(Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS));
-		// Any regions that were implicitly unsubscribed by overflowing the max active size
 
-		const subscribedRegions = allRegions.slice(Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS));
+		// Any regions that were implicitly unsubscribed by overflowing the max active size
+		const unsubscribedRegions = allRegions.slice(
+			0,
+			Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS)
+		);
 
 		// Update subscribed regions on this ws
 		this.clients.set(ws, {
@@ -188,6 +193,30 @@ export class InfinichatInstance extends DurableObject {
 	unsubscribe(ws: WebSocket, data: Record<string, any>) {}
 	update(ws: WebSocket, data: Record<string, any>) {}
 	load(ws: WebSocket, data: Record<string, any>) {}
+
+	addActiveRegions(ws: WebSocket, regions: RegionList) {
+		regions.forEach((region: [number, number]) => {
+			this.activeRegions.get();
+		});
+	}
+
+	// Must be a string formatted "[number]-[number]"
+	isValidRegion(regionString: string) {
+		if (!regionString?.length) return false;
+
+		// There must be exactly two numbers
+		const splitRegion = regionString.split("-");
+		if (splitRegion.length !== 2) return false;
+
+		// They must be numbers
+		if (isNaN(+splitRegion[0]) || isNaN(+splitRegion[1])) return false;
+
+		// They must be whole numbers
+		if (+splitRegion[0] % 1 !== 0) return false;
+		if (+splitRegion[1] % 1 !== 0) return false;
+
+		return true;
+	}
 
 	// Helper fn to generate uniform websocket messages
 	serialize(type: string, data: Record<string, any>): string {
