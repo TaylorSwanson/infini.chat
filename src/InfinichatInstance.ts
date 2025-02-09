@@ -8,6 +8,9 @@ import { Env } from "./index";
 // https://developers.cloudflare.com/durable-objects/api/state/#acceptwebsocket
 // https://developers.cloudflare.com/durable-objects/best-practices/websockets/#websocket-hibernation-api
 
+// Max number of regions one client can subscribe to at once
+const MAX_ACTIVE_REGIONS = 20;
+
 type RegionList = [number, number][];
 
 interface ClientState {
@@ -98,20 +101,26 @@ export class InfinichatInstance extends DurableObject {
 			message = this.deserialize(payload);
 		} catch (e: unknown) {
 			console.error("Could not parse incoming message, error: " + e);
+
+			this.handleError(ws, "Unexpected message payload");
 			return;
 		}
 
 		// Call handler for this message dynamically, if it exists
-		const handler = this.messageHandlers[message.type as keyof typeof this.messageHandlers];
-		if (!handler) {
-			console.error(`Handler for message type "${message.type}" does not exist`);
+		if (!["subscribe", "unsubscribe", "update", "load"].includes(message.type)) {
+			this.handleError(ws, `Unknown message type: "${message.type}"`);
 			return;
 		}
 
-		return handler(ws, message.data);
+		if (message.type === "subscribe") return this.subscribe(ws, message.data);
 	}
 
-	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void | Promise<void> {
+	async webSocketClose(
+		ws: WebSocket,
+		code: number,
+		reason: string,
+		wasClean: boolean
+	): void | Promise<void> {
 		//
 	}
 
@@ -119,11 +128,16 @@ export class InfinichatInstance extends DurableObject {
 		//
 	}
 
+	async handleError(ws: WebSocket, error: string) {
+		ws.send(this.serialize("error", { error }));
+		console.error(error);
+	}
+
 	// Dynamically define handlers for different message types:
 	// unsubscribe -> stop listening to changes to region
 	// update -> change a specific character / set of characters
-	// fetch -> request contents of a region
-	async subscribe(ws: WebSocket, data: { regions: RegionList }) {
+	// load -> request contents of a region
+	async subscribe(ws: WebSocket, data: Record<string, any>) {
 		if (!data.regions) {
 			console.error("Client region subscribe request malformed");
 			return;
@@ -132,7 +146,7 @@ export class InfinichatInstance extends DurableObject {
 			console.error("Client tried to subscribe to 0 regions");
 			return;
 		}
-		if (data.regions?.length > 20) {
+		if (data.regions?.length > MAX_ACTIVE_REGIONS) {
 			// Out of bounds
 			console.error(`Client tried to subscribe to too many regions: ${data.regions.length}`);
 		}
@@ -144,15 +158,31 @@ export class InfinichatInstance extends DurableObject {
 
 		// Add regions, remove duplicates while noting new subscriptions
 		const newSubscriptions: RegionList = [];
-		const subscribedRegions = [...existingRegions, ...data.regions].reduce((accum, region) => {
-			if (accum.indexOf(region) === -1) accum.push(region);
-			if (!existingRegions.includes(region)) newSubscriptions.push(region);
-			return accum;
-		}, [] as RegionList);
+
+		// Note the order here: older subscriptions first, new ones last
+		const allRegions = [...existingRegions, ...data.regions].reduce<RegionList>(
+			(accum: RegionList, region: [number, number]) => {
+				// Search for region in the list - we'll have to compare the tuple
+				const exists = accum.some((r) => r[0] === region[0] && r[1] === region[1]);
+				// Avoid duplicates subscriptions to the same regions
+				if (!exists) accum.push(region);
+				if (!existingRegions.includes(region)) newSubscriptions.push(region);
+
+				return accum;
+			},
+			[] as RegionList
+		);
+
+		// Keep only the maximum subscribed regions - we'll remove first entries in the array
+		// which should presumably be the oldest subscriptions
+		const subscribedRegions = allRegions.slice(Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS));
+		// Any regions that were implicitly unsubscribed by overflowing the max active size
+
+		const subscribedRegions = allRegions.slice(Math.max(0, allRegions.length - MAX_ACTIVE_REGIONS));
 
 		// Update subscribed regions on this ws
 		this.clients.set(ws, {
-			subscribedRegions,
+			subscribedRegions: allRegions,
 		});
 	}
 	unsubscribe(ws: WebSocket, data: Record<string, any>) {}
