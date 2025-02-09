@@ -9,18 +9,32 @@ import { Env } from "./index";
 // https://developers.cloudflare.com/durable-objects/best-practices/websockets/#websocket-hibernation-api
 
 // Max number of regions one client can subscribe to at once
-const MAX_ACTIVE_REGIONS = 20;
+const MAX_ACTIVE_REGIONS = 24;
 
-type RegionList = string[];
+// Side-length of a region in characters
+// https://developers.cloudflare.com/durable-objects/platform/pricing/#key-value-storage-backend
+// ! Changing this value will corrupt any previously-saved regions
+// A "storage unit" is 4KB, which would be 64x64 chars approximately
+// Unicode chars can be between 1-4 bytes each. We're billed in multiples of 4KB,
+// optimize for ~1.2 bytes per char per 4KB, shoot for slightly under 4KB.
+// Keep regions approximately-square -> aspect ratio of ~2:3
+
+// 72 B * 48 B = 3456 B
+// 4 KB / 3456 B => optimized for 1.16 bytes / char
+const REGION_WIDTH = 3 * 24; // 72
+const REGION_HEIGHT = 2 * 24; // 48
+
+// Region size = 30w x 20h = 60 chars
+//
 
 interface ClientState {
-	subscribedRegions: RegionList;
+	subscribedRegions: string[];
 }
 
-type IncomingMessage = {
+interface IncomingMessage {
 	type: string;
 	data: Record<string, any>;
-};
+}
 
 export class InfinichatInstance extends DurableObject {
 	// This object represents an entire Infinichat room, which handles
@@ -33,6 +47,10 @@ export class InfinichatInstance extends DurableObject {
 	clients: Map<WebSocket, ClientState>;
 	// List of regions that are actively being watched and by whom
 	activeRegions: Map<string, WebSocket[]>;
+
+	// Region memory cache
+	// DurableObjects billed for 128MB of memory regardless of actual usage
+	// We should shoot for 64MB of cached data,
 
 	constructor(state: DurableObjectState, env: Env) {
 		// Constructor executes when DO is first created
@@ -133,6 +151,16 @@ export class InfinichatInstance extends DurableObject {
 	async handleError(ws: WebSocket, error: string) {
 		ws.send(this.serializeMsg("error", { error }));
 		console.error(error);
+	}
+
+	async sendMessage(ws: WebSocket, type: string, data: Record<string, any>) {
+		try {
+			const messageString = this.serializeMsg(type, data);
+			ws.send(messageString);
+		} catch (e) {
+			// Connection is dead
+			this.clients.delete(ws);
+		}
 	}
 
 	// Dynamically define handlers for different message types:
@@ -239,8 +267,11 @@ export class InfinichatInstance extends DurableObject {
 		});
 	}
 
-	removeClientFromRegions(ws: WebSocket, regions: string[]) {
-		regions.forEach((region: string) => {
+	// Remove a client from a list of regions, or all regions if not specified
+	removeClientFromRegions(ws: WebSocket, regions?: string[]) {
+		const targetRegions = regions ?? Array.from(this.activeRegions.keys());
+
+		targetRegions.forEach((region: string) => {
 			const existingClients = this.activeRegions.get(region) ?? [];
 
 			const idx = existingClients.indexOf(ws);
@@ -258,13 +289,19 @@ export class InfinichatInstance extends DurableObject {
 		});
 	}
 
+	// Clean up subscriptions and anything else associated with a client
+	cleanupClient(ws: WebSocket) {
+		this.clients.delete(ws);
+		this.removeClientFromRegions(ws);
+	}
+
+	loadRegion(region: string) {
+		// TODO
+	}
 	// Invoke on a region to clear its cached data, if any
 	unloadRegion(region: string) {
 		// TODO
 		this.activeRegions.delete(region);
-	}
-	loadRegion(region: string) {
-		// TODO
 	}
 
 	// Must be a string formatted "[number]-[number]"
