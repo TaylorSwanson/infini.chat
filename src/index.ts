@@ -42,4 +42,4 @@ export default {
 	},
 };
 
-export { InfinichatInstance };
+// export { InfinichatInstance };

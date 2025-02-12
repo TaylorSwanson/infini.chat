@@ -12,6 +12,7 @@
 	"durable_objects": {
 		"bindings": [
 			{
+				"script_name": "src/InfinichatInstance.ts",
 				"class_name": "InfinichatInstance",
 				"name": "INFINICHAT_INSTANCE"
 			}
