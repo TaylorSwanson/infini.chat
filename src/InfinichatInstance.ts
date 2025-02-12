@@ -4,6 +4,13 @@ import { Env } from "./index";
 
 // Single instance of an Infinichat room
 
+// Read/write to the DurableObject KV store with the SQLite backend enabled!
+// Pricing is more favorable for a large number of writes:
+// 		2 Key-value methods like get(), put(), delete(), or list() store and query
+// 		data in a hidden SQLite table and are billed as rows read and rows written.
+// (25B Reads, 50M Writes to SQL backend in the free tier)
+// https://developers.cloudflare.com/workers/platform/pricing/#sqlite-storage-backend
+
 // Useful resources:
 // https://developers.cloudflare.com/durable-objects/api/state/#acceptwebsocket
 // https://developers.cloudflare.com/durable-objects/best-practices/websockets/#websocket-hibernation-api
@@ -23,9 +30,6 @@ const MAX_ACTIVE_REGIONS = 24;
 // 4 KB / 3456 B => optimized for 1.16 bytes / char
 const REGION_WIDTH = 3 * 24; // 72
 const REGION_HEIGHT = 2 * 24; // 48
-
-// Region size = 30w x 20h = 60 chars
-//
 
 interface ClientState {
 	subscribedRegions: string[];
@@ -56,8 +60,6 @@ export class InfinichatInstance extends DurableObject {
 		// Constructor executes when DO is first created
 		// OR after a hibernating ws connection wakes back up
 
-		// This object may have been woken up after hibernating
-
 		super(state, env);
 		this.state = state;
 		this.env = env;
@@ -76,19 +78,16 @@ export class InfinichatInstance extends DurableObject {
 			// Attempt to load any data about this specific ws connection
 			// This is relevant in the case that we're waking up
 			try {
-				const existingData = JSON.parse(ws.deserializeAttachment());
-				if (existingData) {
-					clientState = existingData as ClientState; // !
-				}
-
-				// TODO update this.activeRegions with individual subscription info
+				clientState = JSON.parse(ws.deserializeAttachment());
 			} catch (e) {
 				// The existing state is not set or is corrupt
 				// This does not matter, we've defaulted to an empty clientState already
 			}
 
-			// Re-apply associate client with state
+			// Re-associate state with the client
 			this.clients.set(ws, clientState);
+			// Re-subscribe
+			this.addClientToRegions(ws, clientState.subscribedRegions);
 		});
 	}
 
@@ -110,6 +109,8 @@ export class InfinichatInstance extends DurableObject {
 			status: 101,
 			webSocket: client,
 		});
+
+		// webSocketMessages will handle future messages from here
 	}
 
 	async webSocketMessage(ws: WebSocket, payload: string | ArrayBuffer): Promise<void> {
@@ -169,7 +170,7 @@ export class InfinichatInstance extends DurableObject {
 	// load -> request contents of a region
 	async subscribe(ws: WebSocket, data: Record<string, any>) {
 		if (!data.regions || !Array.isArray(data.regions)) {
-			this.handleError(ws, "Subscription request is malformed");
+			this.handleError(ws, "Subscribe request is malformed");
 			return;
 		}
 		if (!data.regions.length) {
@@ -220,7 +221,7 @@ export class InfinichatInstance extends DurableObject {
 		this.clients.set(ws, {
 			subscribedRegions: allRegions,
 		});
-		this.saveClientData(ws);
+		this.triggerClientSave(ws);
 
 		// Update tracked regions to match the new state
 		this.addClientToRegions(ws, subscribedRegions);
@@ -239,13 +240,35 @@ export class InfinichatInstance extends DurableObject {
 		// 	regions: subscribedRegions.map(region => )
 		// }))
 	}
-	unsubscribe(ws: WebSocket, data: Record<string, any>) {}
+	unsubscribe(ws: WebSocket, data: Record<string, any>) {
+		if (!data.regions || !Array.isArray(data.regions)) {
+			this.handleError(ws, "Unsubscribe request is malformed");
+			return;
+		}
+		if (data.regions.some((region) => !this.isValidRegion(region))) {
+			this.handleError(ws, "One or more region keys is invalid");
+			return;
+		}
+
+		const clientState = this.clients.get(ws);
+		const existingRegions: string[] = clientState?.subscribedRegions ?? [];
+
+		// Remove from client's region list
+		const updatedRegions = existingRegions.filter((region) => !data.regions.includes(region));
+		this.clients.set(ws, {
+			subscribedRegions: updatedRegions,
+		});
+		this.triggerClientSave(ws);
+
+		this.removeClientFromRegions(ws, data.regions);
+	}
 	update(ws: WebSocket, data: Record<string, any>) {}
 	load(ws: WebSocket, data: Record<string, any>) {}
 
 	// Trigger an update of the stored ClientState associated with this websocket
 	// This data will used to reinstantiate the instance if it hibernates
-	saveClientData(ws: WebSocket) {
+	// ! side effects
+	triggerClientSave(ws: WebSocket) {
 		const attachmentData = this.clients.get(ws);
 		if (!attachmentData) return;
 
@@ -295,12 +318,27 @@ export class InfinichatInstance extends DurableObject {
 		this.removeClientFromRegions(ws);
 	}
 
-	loadRegion(region: string) {
-		// TODO
+	//
+	async loadRegion(region: string) {
+		return ((await this.ctx.storage.get(region)) as string) ?? "";
 	}
+
+	// Saves region value to disk - the runtime will likely cache it for us
+	async saveRegion(region: string, regionData: string) {
+		// Enforce limits
+		if (regionData.length !== REGION_WIDTH * REGION_HEIGHT) {
+			throw new Error(
+				`Tried to save a region of length ${regionData.length}, expected exactly ${
+					REGION_WIDTH * REGION_HEIGHT
+				}`
+			);
+		}
+
+		await this.ctx.storage.put(region, regionData);
+	}
+
 	// Invoke on a region to clear its cached data, if any
 	unloadRegion(region: string) {
-		// TODO
 		this.activeRegions.delete(region);
 	}
 
