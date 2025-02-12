@@ -1,7 +1,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "src",
-	"main": "src/index.ts",
+	"main": "src/InfinichatInstance.ts",
 	"compatibility_date": "2025-02-04",
 	"migrations": [
 		{

@@ -40,7 +40,7 @@ interface IncomingMessage {
 	data: Record<string, any>;
 }
 
-export class InfinichatInstance extends DurableObject {
+export default class InfinichatInstance extends DurableObject {
 	// This object represents an entire Infinichat room, which handles
 	// websocket messages and ephemeral state
 
@@ -131,7 +131,9 @@ export class InfinichatInstance extends DurableObject {
 			return;
 		}
 
+		// Custom message handlers
 		if (message.type === "subscribe") return this.subscribe(ws, message.data);
+		if (message.type === "load") return this.load(ws, message.data);
 		//
 		return;
 	}
@@ -174,7 +176,7 @@ export class InfinichatInstance extends DurableObject {
 			return;
 		}
 		if (!data.regions.length) {
-			this.handleError(ws, "Must subscribe to at least 1 region");
+			this.handleError(ws, "Specify at least 1 region to subscribe to");
 			return;
 		}
 		if (data.regions.length > MAX_ACTIVE_REGIONS) {
@@ -235,10 +237,8 @@ export class InfinichatInstance extends DurableObject {
 			})
 		);
 
-		// TODO send region data
-		// ws.send(this.serializeMsg("regionData", {
-		// 	regions: subscribedRegions.map(region => )
-		// }))
+		// Send newly subscribed regions
+		this.sendRegions(ws, subscribedRegions);
 	}
 	unsubscribe(ws: WebSocket, data: Record<string, any>) {
 		if (!data.regions || !Array.isArray(data.regions)) {
@@ -262,8 +262,39 @@ export class InfinichatInstance extends DurableObject {
 
 		this.removeClientFromRegions(ws, data.regions);
 	}
-	update(ws: WebSocket, data: Record<string, any>) {}
-	load(ws: WebSocket, data: Record<string, any>) {}
+
+	update(ws: WebSocket, data: Record<string, any>) {
+		// TODO
+		// Data should include x,y coordinates of each change as well as the new value.
+		// By specifically indicating which coordinate is updated, we can avoid accidentally
+		// overwriting changes made by others (including deletes, spaces, etc.) that might be
+		// lost if we sent a full region update
+		// TODO sender-rate limit
+		// TODO send incremental updates
+		// IDEA this is where we can attach additional metadata (such as owner) to any
+		// specific cells. We could also use an LLM to look at nearby cells to generate
+		// adjacent text - which we could color a very light gray to indicate machine-generated
+	}
+	load(ws: WebSocket, data: Record<string, any>) {
+		if (!data.regions || !Array.isArray(data.regions)) {
+			this.handleError(ws, "Unsubscribe request is malformed");
+			return;
+		}
+		if (!data.regions.length) {
+			this.handleError(ws, "Specify at least 1 region to load");
+			return;
+		}
+		if (data.regions.length > MAX_ACTIVE_REGIONS) {
+			this.handleError(ws, `Cannot load more than ${MAX_ACTIVE_REGIONS} regions at a time`);
+			return;
+		}
+		if (data.regions.some((region) => !this.isValidRegion(region))) {
+			this.handleError(ws, "One or more region keys is invalid");
+			return;
+		}
+
+		this.sendRegions(ws, data.regions);
+	}
 
 	// Trigger an update of the stored ClientState associated with this websocket
 	// This data will used to reinstantiate the instance if it hibernates
@@ -325,6 +356,12 @@ export class InfinichatInstance extends DurableObject {
 
 	// Saves region value to disk - the runtime will likely cache it for us
 	async saveRegion(region: string, regionData: string) {
+		// Delete regions if they're empty
+		if (regionData.trim().length === 0) {
+			await this.ctx.storage.delete(region);
+			return;
+		}
+
 		// Enforce limits
 		if (regionData.length !== REGION_WIDTH * REGION_HEIGHT) {
 			throw new Error(
@@ -360,8 +397,30 @@ export class InfinichatInstance extends DurableObject {
 		return true;
 	}
 
-	serializeRegion(region: string) {
-		//
+	// Send full region data to a client
+	async sendRegions(ws: WebSocket, regions: string[]) {
+		const storedRegions = await this.ctx.storage.get(regions);
+
+		// Uninstantiated regions are explicitly null
+		const regionData: Record<string, string | null> = {};
+
+		storedRegions.forEach((data, region) => {
+			if (data !== undefined && typeof data !== "string") {
+				// Unexpected state, data should always be a string
+				console.warn(
+					`Region data was of type "${typeof data}", expected type "string" - corruption?`
+				);
+				data = null;
+			}
+
+			regionData[region] = data ? data.toString() : null;
+		});
+
+		ws.send(
+			this.serializeMsg("regionData", {
+				regions: regionData,
+			})
+		);
 	}
 
 	// Helper fn to generate uniform websocket messages
