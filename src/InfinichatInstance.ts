@@ -92,7 +92,7 @@ export default class InfinichatInstance extends DurableObject {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		// New request / client is passed in from a worker
+		// New request / client is passed in from base worker
 		// Each DO instance represents a single room that multiple users can connect to
 
 		// Websocket setup
