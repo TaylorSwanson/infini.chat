@@ -5,7 +5,7 @@
 	"compatibility_date": "2025-02-04",
 	"migrations": [
 		{
-			"new_classes": ["InfinichatInstance"],
+			"new_sqlite_classes": ["InfinichatInstance"],
 			"tag": "v1"
 		}
 	],
