@@ -40,6 +40,12 @@ interface IncomingMessage {
 	data: Record<string, any>;
 }
 
+interface UpdateMessage {
+	region: string;
+	position: { x: number; y: number };
+	value: string;
+}
+
 export default class InfinichatInstance extends DurableObject {
 	// This object represents an entire Infinichat room, which handles
 	// websocket messages and ephemeral state
@@ -264,6 +270,38 @@ export default class InfinichatInstance extends DurableObject {
 	}
 
 	update(ws: WebSocket, data: Record<string, any>) {
+		if (!data?.updates || !Array.isArray(data.updates)) {
+			this.handleError(ws, "Update request is malformed");
+			return;
+		}
+		if (!data.updates.length) {
+			this.handleError(ws, "Provide at least 1 change");
+			return;
+		}
+		if (data.updates.some((update) => !this.isValidUpdate(update))) {
+			this.handleError(ws, "Update values are invalid");
+			return;
+		}
+		const clientState = this.clients.get(ws);
+		if (!clientState) {
+			// This is problematic since it shouldn't happen
+			// Somewhere we are losing track of who's connected
+			console.warn("Received an update from a client that doesn't have a registered state");
+			this.handleError(ws, "Unknown client");
+			return;
+		}
+		// Ensure user is updating a region they are subscribed to
+		const isClientSubscribed = !data.updates.some((update: UpdateMessage) => {
+			// Testing for the inverse case, where an update is NOT valid - it's faster
+			return !clientState.subscribedRegions.includes(update.region);
+		});
+		if (!isClientSubscribed) {
+			this.handleError(ws, "Attempted to update regions which client is not subscribed to");
+			return;
+		}
+
+		data.updates.forEach((change) => {});
+
 		// TODO
 		// Data should include x,y coordinates of each change as well as the new value.
 		// By specifically indicating which coordinate is updated, we can avoid accidentally
@@ -393,6 +431,22 @@ export default class InfinichatInstance extends DurableObject {
 		// They must be whole numbers
 		if (+splitRegion[0] % 1 !== 0) return false;
 		if (+splitRegion[1] % 1 !== 0) return false;
+
+		return true;
+	}
+
+	isValidUpdate(changeObject: UpdateMessage): changeObject is UpdateMessage {
+		// Changes must include value, xy position, and region
+
+		if (!this.isValidRegion(changeObject.region)) return false;
+		// Must be numbers
+		if (typeof changeObject.position?.x !== "number") return false;
+		if (typeof changeObject.position?.y !== "number") return false;
+		// Position must be a whole number
+		if (+changeObject.position.x % 1 !== 0) return false;
+		if (+changeObject.position.y % 1 !== 0) return false;
+		// A change can be at most one character
+		if (changeObject.value?.length !== 1) return false;
 
 		return true;
 	}
