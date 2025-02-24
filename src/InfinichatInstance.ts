@@ -31,8 +31,19 @@ const MAX_ACTIVE_REGIONS = 24;
 const REGION_WIDTH = 3 * 24; // 72
 const REGION_HEIGHT = 2 * 24; // 48
 
+// Momentum decreases as <falloff> / time elapsed (s)
+// const MOMENTUM_FALLOFF = 3;
+
 interface ClientState {
 	subscribedRegions: string[];
+	momentum: {
+		// Computed values
+		x: number;
+		y: number;
+		// Epoch values
+		eventsX: number[];
+		eventsY: number[];
+	};
 }
 
 interface IncomingMessage {
@@ -75,6 +86,7 @@ export default class InfinichatInstance extends DurableObject {
 		this.state.getWebSockets().forEach((ws) => {
 			let clientState: ClientState = {
 				subscribedRegions: [],
+				momentum: { x: 0, y: 0 },
 			};
 
 			// Attempt to load any data about this specific ws connection
@@ -207,9 +219,17 @@ export default class InfinichatInstance extends DurableObject {
 		}
 
 		// Client state should be attached to websocket, but we'll be aware of
-		// the impossible case where it is not
-		const clientState = this.clients.get(ws);
-		const existingRegions: string[] = clientState?.subscribedRegions ?? [];
+		// the impossible case where it is not - and we'll set it to the default in that case
+		let clientState = this.clients.get(ws);
+		if (!clientState) {
+			console.warn("ClientState was undefined when it should have already been set");
+
+			clientState = {
+				subscribedRegions: [],
+				momentum: { x: 0, y: 0 },
+			};
+		}
+		const existingRegions: string[] = clientState.subscribedRegions ?? [];
 
 		// Add regions, remove duplicates while noting new subscriptions
 		const newSubscriptions: string[] = [];
@@ -239,6 +259,7 @@ export default class InfinichatInstance extends DurableObject {
 
 		// Update subscribed regions attached to this client
 		this.clients.set(ws, {
+			...clientState,
 			subscribedRegions: allRegions,
 		});
 		this.triggerClientSave(ws);
@@ -268,12 +289,22 @@ export default class InfinichatInstance extends DurableObject {
 			return;
 		}
 
-		const clientState = this.clients.get(ws);
-		const existingRegions: string[] = clientState?.subscribedRegions ?? [];
+		// ClientState should be set, we'll handle the impossible case where it is not
+		let clientState = this.clients.get(ws);
+		if (!clientState) {
+			console.warn("ClientState was undefined when it should have already been set");
+
+			clientState = {
+				subscribedRegions: [],
+				momentum: { x: 0, y: 0 },
+			};
+		}
+		const existingRegions: string[] = clientState.subscribedRegions ?? [];
 
 		// Remove from client's region list
 		const updatedRegions = existingRegions.filter((region) => !data.regions.includes(region));
 		this.clients.set(ws, {
+			...clientState,
 			subscribedRegions: updatedRegions,
 		});
 		this.triggerClientSave(ws);
