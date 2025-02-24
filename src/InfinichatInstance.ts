@@ -58,10 +58,6 @@ export default class InfinichatInstance extends DurableObject {
 	// List of regions that are actively being watched and by whom
 	activeRegions: Map<string, WebSocket[]>;
 
-	// Region memory cache
-	// DurableObjects billed for 128MB of memory regardless of actual usage
-	// We should shoot for 64MB of cached data,
-
 	constructor(state: DurableObjectState, env: Env) {
 		// Constructor executes when DO is first created
 		// OR after a hibernating ws connection wakes back up
@@ -116,7 +112,7 @@ export default class InfinichatInstance extends DurableObject {
 			webSocket: client,
 		});
 
-		// webSocketMessages will handle future messages from here
+		// -> webSocketMessages will handle future messages from here ->
 	}
 
 	async webSocketMessage(ws: WebSocket, payload: string | ArrayBuffer): Promise<void> {
@@ -139,30 +135,46 @@ export default class InfinichatInstance extends DurableObject {
 
 		// Custom message handlers
 		if (message.type === "subscribe") return this.subscribe(ws, message.data);
+		if (message.type === "unsubscribe") return this.unsubscribe(ws, message.data);
 		if (message.type === "load") return this.load(ws, message.data);
+		if (message.type === "update") return this.update(ws, message.data);
 		//
+
+		this.handleError(ws, "Message type not supported");
 		return;
 	}
 
-	// async webSocketClose(
-	// 	ws: WebSocket,
-	// 	code: number,
-	// 	reason: string,
-	// 	wasClean: boolean
-	// ): void | Promise<void> {
-	// 	//
-	// }
+	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+		// Remove ws from list of active regions
+		for (let regionTuple of this.activeRegions.entries()) {
+			const regionName = regionTuple[0];
+			const websockets = regionTuple[1];
 
-	// async webSocketError(ws: WebSocket, error: unknown): void | Promise<void> {
-	// 	//
-	// }
+			const idx = websockets.indexOf(ws);
+			if (idx === -1) continue;
+
+			// Update region's subscriber list
+			this.activeRegions.set(regionName, websockets.splice(idx, 1));
+		}
+
+		// Clear ClientState
+		this.clients.delete(ws);
+
+		if (!wasClean) {
+			console.warn(`Websocket closed unexpectedly: code ${code} ${reason}`);
+		}
+	}
+
+	async webSocketError(ws: WebSocket, error: unknown) {
+		console.error("Websocket error:", error);
+	}
 
 	async handleError(ws: WebSocket, error: string) {
 		ws.send(this.serializeMsg("error", { error }));
 		console.error(error);
 	}
 
-	async sendMessage(ws: WebSocket, type: string, data: Record<string, any>) {
+	sendMessage(ws: WebSocket, type: string, data: Record<string, any>) {
 		try {
 			const messageString = this.serializeMsg(type, data);
 			ws.send(messageString);
@@ -205,7 +217,7 @@ export default class InfinichatInstance extends DurableObject {
 		// Note the order here: older subscriptions first, new ones last
 		const allRegions = [...existingRegions, ...data.regions].reduce<string[]>(
 			(accum: string[], region: string) => {
-				// Avoid duplicates subscriptions to the same regions
+				// Avoid duplicate subscriptions to the same regions
 				if (accum.indexOf(region) === -1) accum.push(region);
 				if (!existingRegions.includes(region)) newSubscriptions.push(region);
 
@@ -300,18 +312,38 @@ export default class InfinichatInstance extends DurableObject {
 			return;
 		}
 
-		data.updates.forEach((change) => {});
+		// Broadcast update to other subscribers
+		data.updates.forEach((change: UpdateMessage) => {
+			const regionSubscribers = this.activeRegions.get(change.region);
+			if (!regionSubscribers?.length) return;
 
-		// TODO
+			// Build a new update message object, avoid reusing payloads
+			const newUpdateMessage: UpdateMessage = {
+				region: change.region,
+				position: {
+					x: +change.position.x, // cast
+					y: +change.position.y, // cast
+				},
+				value: change.value.slice(0, 1),
+			};
+
+			for (let client of regionSubscribers) {
+				// Skip self, avoid rebroadcasting
+				if (client === ws) continue;
+
+				this.sendMessage(client, "update", newUpdateMessage);
+			}
+		});
+
 		// Data should include x,y coordinates of each change as well as the new value.
 		// By specifically indicating which coordinate is updated, we can avoid accidentally
 		// overwriting changes made by others (including deletes, spaces, etc.) that might be
 		// lost if we sent a full region update
+
 		// TODO sender-rate limit
-		// TODO send incremental updates
 		// IDEA this is where we can attach additional metadata (such as owner) to any
-		// specific cells. We could also use an LLM to look at nearby cells to generate
-		// adjacent text - which we could color a very light gray to indicate machine-generated
+		// specific cells. We could also use wavefunction collapse to generate relevant adjacent
+		// characters as the user types
 	}
 	load(ws: WebSocket, data: Record<string, any>) {
 		if (!data.regions || !Array.isArray(data.regions)) {
@@ -347,7 +379,7 @@ export default class InfinichatInstance extends DurableObject {
 	}
 
 	// Marks the websocket as a subscriber to a list of regions in activeRegions
-	// NOTE we're not validating region strings here - be mindful
+	// NOTE we're not validating region strings in this function - be mindful
 	addClientToRegions(ws: WebSocket, regions: string[]) {
 		regions.forEach((region: string) => {
 			const existingClients = this.activeRegions.get(region) ?? [];
